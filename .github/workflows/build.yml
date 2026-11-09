@@ -313,6 +313,24 @@ jobs:
       - name: Permission fichiers
         run: |
           sed -i 's#<application#<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n    <application#' app/android/app/src/main/AndroidManifest.xml
+      - name: Corriger compileSdk des plugins
+        run: |
+          cd app/android
+          cat > fix.kts <<'FIXEOF'
+          subprojects {
+              afterEvaluate {
+                  if (plugins.hasPlugin("com.android.library") || plugins.hasPlugin("com.android.application")) {
+                      extensions.configure<com.android.build.gradle.BaseExtension> {
+                          compileSdkVersion(36)
+                      }
+                  }
+              }
+          }
+
+          FIXEOF
+          cat fix.kts build.gradle.kts > tmp.kts
+          mv tmp.kts build.gradle.kts
+          rm fix.kts
       - name: Compiler
         run: |
           cd app
@@ -322,3 +340,4 @@ jobs:
         with:
           name: pdf-audio-apk
           path: app/build/app/outputs/flutter-apk/app-release.apk
+          

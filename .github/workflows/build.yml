@@ -1,0 +1,324 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Creer le projet
+        run: flutter create --platforms=android --project-name pdf_audio app
+      - name: Ecrire pubspec.yaml
+        run: |
+          cat > app/pubspec.yaml <<'PUBEOF'
+          name: pdf_audio
+          description: Transforme un PDF en fichier audio.
+          publish_to: none
+          version: 1.0.0
+
+          environment:
+            sdk: ">=3.3.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            flutter_tts: ^4.2.0
+            audioplayers: ^6.1.0
+            file_picker: ^8.1.2
+            permission_handler: ^11.3.1
+            path_provider: ^2.1.4
+            syncfusion_flutter_pdf: ^27.2.5
+
+          flutter:
+            uses-material-design: true
+          PUBEOF
+      - name: Ecrire main.dart
+        run: |
+          cat > app/lib/main.dart <<'DARTEOF'
+          import 'dart:io';
+          import 'dart:typed_data';
+          import 'package:audioplayers/audioplayers.dart';
+          import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter_tts/flutter_tts.dart';
+          import 'package:path_provider/path_provider.dart';
+          import 'package:permission_handler/permission_handler.dart';
+          import 'package:syncfusion_flutter_pdf/pdf.dart';
+
+          void main() => runApp(MaterialApp(
+                title: 'PDF → Audio',
+                theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
+                home: const HomePage(),
+              ));
+
+          // ───────────── 1. Liste des PDF du téléphone ─────────────
+          class HomePage extends StatefulWidget {
+            const HomePage({super.key});
+            @override
+            State<HomePage> createState() => _HomePageState();
+          }
+
+          class _HomePageState extends State<HomePage> {
+            List<File> pdfs = [];
+            bool loading = true;
+
+            @override
+            void initState() {
+              super.initState();
+              _scan();
+            }
+
+            Future<void> _scan() async {
+              await Permission.manageExternalStorage.request();
+              final found = <File>[];
+              for (final p in [
+                '/storage/emulated/0/Download',
+                '/storage/emulated/0/Documents'
+              ]) {
+                final d = Directory(p);
+                if (!await d.exists()) continue;
+                try {
+                  await for (final e in d.list(recursive: true, followLinks: false)) {
+                    if (e is File && e.path.toLowerCase().endsWith('.pdf')) found.add(e);
+                  }
+                } catch (_) {}
+              }
+              if (mounted) setState(() { pdfs = found; loading = false; });
+            }
+
+            void _open(File f) => Navigator.push(
+                context, MaterialPageRoute(builder: (_) => ConvertPage(file: f)));
+
+            Future<void> _browse() async {
+              final r = await FilePicker.platform
+                  .pickFiles(type: FileType.custom, allowedExtensions: ['pdf']);
+              if (r?.files.single.path != null) _open(File(r!.files.single.path!));
+            }
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+                  appBar: AppBar(title: const Text('Mes PDF')),
+                  floatingActionButton: FloatingActionButton.extended(
+                      onPressed: _browse,
+                      icon: const Icon(Icons.folder_open),
+                      label: const Text('Parcourir')),
+                  body: loading
+                      ? const Center(child: CircularProgressIndicator())
+                      : pdfs.isEmpty
+                          ? const Center(child: Text('Aucun PDF trouvé'))
+                          : ListView.builder(
+                              itemCount: pdfs.length,
+                              itemBuilder: (_, i) => ListTile(
+                                leading: const Icon(Icons.picture_as_pdf, color: Colors.red),
+                                title: Text(pdfs[i].path.split('/').last),
+                                onTap: () => _open(pdfs[i]),
+                              ),
+                            ),
+                );
+          }
+
+          // ───────────── 2. Réglages + conversion ─────────────
+          class ConvertPage extends StatefulWidget {
+            final File file;
+            const ConvertPage({super.key, required this.file});
+            @override
+            State<ConvertPage> createState() => _ConvertPageState();
+          }
+
+          class _ConvertPageState extends State<ConvertPage> {
+            final tts = FlutterTts();
+            final player = AudioPlayer();
+            String? outPath;
+            bool playing = false;
+            final nameCtrl = TextEditingController();
+            int total = 0;
+            RangeValues range = const RangeValues(1, 1);
+            double speed = 0.5; // 0.5 = vitesse normale sur Android
+            double progress = 0;
+            bool busy = false;
+            String? status;
+
+            @override
+            void dispose() {
+              player.dispose();
+              super.dispose();
+            }
+
+            @override
+            void initState() {
+              super.initState();
+              player.onPlayerComplete.listen((_) => setState(() => playing = false));
+              nameCtrl.text = widget.file.path.split('/').last.replaceAll(RegExp(r'\.pdf$', caseSensitive: false), '');
+              _load();
+            }
+
+            Future<void> _load() async {
+              final doc = PdfDocument(inputBytes: await widget.file.readAsBytes());
+              total = doc.pages.count;
+              doc.dispose();
+              setState(() => range = RangeValues(1, total.toDouble()));
+            }
+
+            // Découpe le texte en morceaux < 3500 caractères (limite du moteur vocal)
+            List<String> _chunks(String text) {
+              final out = <String>[];
+              var cur = StringBuffer();
+              for (final s in text.replaceAll(RegExp(r'\s+'), ' ').split(RegExp(r'(?<=[.!?]) '))) {
+                if (cur.length + s.length > 3500 && cur.isNotEmpty) {
+                  out.add(cur.toString());
+                  cur = StringBuffer();
+                }
+                cur.write('$s ');
+              }
+              if (cur.isNotEmpty) out.add(cur.toString());
+              return out;
+            }
+
+            Future<void> _convert() async {
+              final name = nameCtrl.text.trim().isEmpty ? 'audio' : nameCtrl.text.trim();
+              setState(() { busy = true; progress = 0; status = 'Lecture du PDF…'; });
+
+              final doc = PdfDocument(inputBytes: await widget.file.readAsBytes());
+              final ex = PdfTextExtractor(doc);
+              final text = ex.extractText(
+                  startPageIndex: range.start.round() - 1, endPageIndex: range.end.round() - 1);
+              doc.dispose();
+
+              final chunks = _chunks(text);
+              if (chunks.isEmpty) {
+                setState(() { busy = false; status = 'Aucun texte trouvé (PDF scanné ?)'; });
+                return;
+              }
+
+              await tts.setLanguage('fr-FR');
+              await tts.setSpeechRate(speed);
+              await tts.awaitSynthCompletion(true);
+
+              final tmp = await getTemporaryDirectory();
+              final parts = <File>[];
+              for (var i = 0; i < chunks.length; i++) {
+                setState(() { status = 'Synthèse ${i + 1}/${chunks.length}'; progress = i / chunks.length; });
+                final path = '${tmp.path}/part_$i.wav';
+                await tts.synthesizeToFile(chunks[i], path, true);
+                parts.add(File(path));
+              }
+
+              setState(() => status = 'Assemblage…');
+              var outDir = Directory('/storage/emulated/0/Download/PDF Audio');
+              try { await outDir.create(recursive: true); }
+              catch (_) { outDir = await getApplicationDocumentsDirectory(); }
+              final out = File('${outDir.path}/$name.wav');
+              await _mergeWavs(parts, out);
+              for (final p in parts) { await p.delete(); }
+
+              setState(() { busy = false; progress = 1; status = 'Terminé ✅\n${out.path}'; outPath = out.path; });
+            }
+
+            // Concatène plusieurs WAV en un seul
+            Future<void> _mergeWavs(List<File> parts, File out) async {
+              final pcm = BytesBuilder();
+              Uint8List? header;
+              for (final f in parts) {
+                final b = await f.readAsBytes();
+                var i = 12;
+                while (i + 8 <= b.length) {
+                  final id = String.fromCharCodes(b.sublist(i, i + 4));
+                  final size = ByteData.sublistView(b, i + 4, i + 8).getUint32(0, Endian.little);
+                  if (id == 'data') {
+                    header ??= Uint8List.fromList(b.sublist(0, i));
+                    final end = (size == 0 || i + 8 + size > b.length) ? b.length : i + 8 + size;
+                    pcm.add(b.sublist(i + 8, end));
+                    break;
+                  }
+                  i += 8 + size;
+                }
+              }
+              final data = pcm.toBytes();
+              final h = BytesBuilder()
+                ..add(header!)
+                ..add('data'.codeUnits)
+                ..add((ByteData(4)..setUint32(0, data.length, Endian.little)).buffer.asUint8List())
+                ..add(data);
+              final all = h.toBytes();
+              ByteData.sublistView(all).setUint32(4, all.length - 8, Endian.little);
+              await out.writeAsBytes(all);
+            }
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+                  appBar: AppBar(title: Text(widget.file.path.split('/').last)),
+                  body: total == 0
+                      ? const Center(child: CircularProgressIndicator())
+                      : ListView(padding: const EdgeInsets.all(20), children: [
+                          Text('Le PDF contient $total page(s)',
+                              style: Theme.of(context).textTheme.titleMedium),
+                          const SizedBox(height: 20),
+                          Text('Pages ${range.start.round()} à ${range.end.round()}'),
+                          if (total > 1)
+                            RangeSlider(
+                              min: 1, max: total.toDouble(), divisions: total - 1,
+                              values: range,
+                              labels: RangeLabels('${range.start.round()}', '${range.end.round()}'),
+                              onChanged: busy ? null : (v) => setState(() => range = v),
+                            ),
+                          const SizedBox(height: 12),
+                          TextField(
+                            controller: nameCtrl,
+                            enabled: !busy,
+                            decoration: const InputDecoration(
+                                labelText: 'Nom du fichier audio', border: OutlineInputBorder()),
+                          ),
+                          const SizedBox(height: 20),
+                          Text('Vitesse : ${(speed * 2).toStringAsFixed(2)}x'),
+                          Slider(
+                            min: 0.25, max: 1.0, divisions: 15, value: speed,
+                            onChanged: busy ? null : (v) => setState(() => speed = v),
+                          ),
+                          const SizedBox(height: 20),
+                          FilledButton.icon(
+                            onPressed: busy ? null : _convert,
+                            icon: const Icon(Icons.headphones),
+                            label: const Text('Convertir en audio'),
+                          ),
+                          if (busy || progress > 0) ...[
+                            const SizedBox(height: 20),
+                            LinearProgressIndicator(value: progress),
+                          ],
+                          if (status != null) Padding(
+                              padding: const EdgeInsets.only(top: 12), child: Text(status!)),
+                          if (outPath != null)
+                            OutlinedButton.icon(
+                              onPressed: () async {
+                                if (playing) {
+                                  await player.pause();
+                                } else {
+                                  await player.play(DeviceFileSource(outPath!));
+                                }
+                                setState(() => playing = !playing);
+                              },
+                              icon: Icon(playing ? Icons.pause : Icons.play_arrow),
+                              label: Text(playing ? 'Pause' : 'Écouter'),
+                            ),
+                        ]),
+                );
+          }
+          DARTEOF
+      - name: Permission fichiers
+        run: |
+          sed -i 's#<application#<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n    <application#' app/android/app/src/main/AndroidManifest.xml
+      - name: Compiler
+        run: |
+          cd app
+          flutter pub get
+          flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf-audio-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
